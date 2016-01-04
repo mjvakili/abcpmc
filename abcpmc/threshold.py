@@ -121,3 +121,39 @@ class ExponentialConstEps(EpsProposal):
     def __call__(self, t):
         return self.eps_vals[t]
 
+class MultiExponentialEps(EpsProposal):
+
+    """
+    Exponentially decreasing threshold
+    :param max: epsilon at t=0
+    :param min: epsilon at t=T
+    :param T: number of iterations
+    """
+    def __init__(self, T, max_eps, min_eps):
+
+        super(MultiExponentialEps, self).__init__(T)
+        min_eps = np.atleast_1d(min_eps)
+        max_eps = np.atleast_1d(max_eps)
+        self.eps_vals = np.zeros((max_eps.shape[0], T))
+
+        for i in range(len(max_eps)):
+            self.eps_vals[i, :] = np.logspace(np.log10(max_eps[i]),
+                                           np.log10(min_eps[i]), T)
+
+        #print("eps=" , self.eps_vals[:,self.t])
+    def __call__(self, t):
+        return self.eps_vals[:, t]
+
+
+class MultiConstEps(EpsProposal):
+    """
+    Constant threshold. Can be used to apply alpha-percentile threshold decrease
+    :param eps: epsilon value
+    """
+
+    def __init__(self, T, eps):
+        super(MultiConstEps, self).__init__(T)
+        self.eps = np.atleast_1d(eps)
+
+    def __call__(self, t):
+        return self.eps
