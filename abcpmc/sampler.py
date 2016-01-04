@@ -26,22 +26,14 @@ import numpy as np
 from scipy import stats
 from scipy import spatial
 
-__all__ = ["GaussianPrior", 
-           "TophatPrior", 
-           "ParticleProposal", 
-           "KNNParticleProposal", 
-           "OLCMParticleProposal", 
-           "Sampler", 
-           "weighted_cov", 
-           "weighted_avg_and_std"
-           ]
+__all__ = ["GaussianPrior", "TophatPrior", "ParticleProposal", "KNNParticleProposal", "OLCMParticleProposal", "Sampler", "weighted_cov", "weighted_avg_and_std"]
 
 class GaussianPrior(object):
     """
     Normal gaussian prior
      
     :param mu: scalar or vector of means
-    :param sigma: scalar variance or covariance matrix
+    :param sigma: scalar std or covariance matrix
     """
     
     def __init__(self, mu, sigma):
@@ -79,16 +71,16 @@ class ParticleProposal(object):
     """
     Creates new particles using twice the weighted covariance matrix (Beaumont et al. 2009)
     """
-    def __init__(self, sampler, eps, pool, kwargs):
+    def __init__(self, sampler, prior, sigma, eps, pool, kwargs):
+        self.prior = prior
         self.postfn = sampler.postfn
         self.distfn = sampler.dist
         self.Y = sampler.Y
         self.N = sampler.N
-        self.eps = np.asanyarray(eps)
+        self.sigma = sigma
+        self.eps = eps
         self.pool = pool
         self.kwargs = kwargs
-        
-        self.sigma = 2 * weighted_cov(pool.thetas, pool.ws)
     
     def __call__(self, i):
         cnt = 1
@@ -99,9 +91,10 @@ class ParticleProposal(object):
             sigma = np.atleast_2d(sigma)
             thetap = np.random.multivariate_normal(theta, sigma)
             X = self.postfn(thetap)
-            p = np.asarray(self.distfn(X, self.Y))
-            
-            if np.all(p <= self.eps):
+            p = self.distfn(X, self.Y)
+            #print("p=" , p)
+            #print("eps=" , self.eps) 
+            if (p <= self.eps).all():
                 break
             cnt+=1
         return thetap, p, cnt
@@ -112,7 +105,6 @@ class ParticleProposal(object):
 class KNNParticleProposal(ParticleProposal):
     """
     Creates new particles using a covariance matrix from the K-nearest neighbours  (Fillipi et al. 2012)
-    Set `k` as key-word arguement in `abcpmc.Sampler.particle_proposal_kwargs`
     """
     
     def _get_sigma(self, theta, k):
@@ -127,14 +119,13 @@ class OLCMParticleProposal(ParticleProposal):
     """
     
     def _get_sigma(self, theta):
-        if len(self.eps.shape) == 0:
-            idx = self.pool.dists < self.eps
-        else:
-            idx = np.all(self.pool.dists < self.eps, axis=1)
+        #print("dist=",np.atleast_2d(self.pool.dists))
+        #print("eps=",self.pool.eps)
+        #idx = self.pool.dists<self.pool.eps
+        idx = [(self.pool.dists[i]<self.pool.eps).all() for i in range(self.pool.dists.shape[0])]
         thetas = self.pool.thetas[idx]
         weights = self.pool.ws[idx]
         weights = weights/np.sum(weights)
-        
         m = np.sum((weights * thetas.T).T, axis=0)
         n = thetas.shape[1]
         
@@ -142,8 +133,22 @@ class OLCMParticleProposal(ParticleProposal):
         for i in range(n):
             for j in range(n):
                 sigma[i, j] = np.sum(weights * (thetas[:, i] - m[i]) * (thetas[:, j] - m[j]).T)  + (m[i] - theta[i]) * (m[j] - theta[j])
-        return sigma
+        return sigma + 1.e-12
 
+
+        
+        
+
+class _FunctionWrapper(object):
+    """
+    Wrapper for the particle proposal functionality needed to be pickle-able
+    """
+    
+    def __init__(self, func):
+        self.func = func
+    
+    def __call__(self, i):
+        return self.func(i)
 
 """Namedtuple representing a pool of one sampling iteration"""
 PoolSpec = namedtuple("PoolSpec", ["t", "eps", "ratio", "thetas", "dists", "ws"])
@@ -184,49 +189,60 @@ class Sampler(object):
         """
         Launches the sampling process. Yields the intermediate results per iteration.
         
+        :param eps: an instance of a threshold proposal (or an other callable) see :py:class:`sampler.ConstEps`
         :param prior: instance of a prior definition (or an other callable)  see :py:class:`sampler.GaussianPrior`
-        :param eps_proposal: an instance of a threshold proposal (or an other callable) see :py:class:`sampler.ConstEps`
         
         :yields pool: yields a namedtuple representing the values of one iteration
         """
         
         eps = eps_proposal.next()
-        wrapper = _RejectionSamplingWrapper(eps, prior, self.postfn, self.dist, self.Y)
-        
+        wrapper = _PostfnWrapper(eps, prior, self.postfn, self.dist, self.Y)
         res = self.mapFunc(wrapper, range(self.N))
         thetas = np.array([theta for (theta, _, _) in res])
         dists = np.array([dist for (_, dist, _) in res])
         cnts = np.sum([cnt for (_, _, cnt) in res])
-        ws = np.ones(self.N) / self.N
+        wt = np.ones(self.N) / self.N
         
-        pool = PoolSpec(0, eps, self.N/cnts, thetas, dists, ws)
+        pool = PoolSpec(0, eps, self.N/cnts, thetas, dists, wt)
         yield pool
         
+        prev_thetas = thetas.copy()
+#         samples.append(thetas)
+        
+        ws = wt
         for i, eps in enumerate(eps_proposal):
             t = i+1
+            sigma = 2 * weighted_cov(thetas, ws)
 
-            particleProposal = self.particle_proposal_cls(self, eps, pool, self.particle_proposal_kwargs)
+            particleProposal = self.particle_proposal_cls(self,
+                                                          prior, 
+                                                          sigma, 
+                                                          eps,
+                                                          pool, 
+                                                          self.particle_proposal_kwargs)
+            wrapper = _FunctionWrapper(particleProposal)
             
-            res = self.mapFunc(particleProposal, range(self.N))
+            res = self.mapFunc(wrapper, range(self.N))
             thetas = np.array([theta for (theta, _, _) in res])
             dists = np.array([dist for (_, dist, _) in res]) 
             cnts = np.sum([cnt for (_, _, cnt) in res])
             
-            sigma = 2 * weighted_cov(pool.thetas, pool.ws)
-            wrapper = _WeightWrapper(prior, sigma, pool.ws, pool.thetas)
-            
+            wrapper = _WeightWrapper(prior, ws, sigma, prev_thetas)
             wt = np.array(list(self.mapFunc(wrapper, thetas)))
             ws = wt/np.sum(wt)
             
             pool = PoolSpec(t, eps, self.N/cnts, thetas, dists, ws)
             yield pool
             
+            prev_thetas = thetas.copy()
+#             samples.append(thetas)
             
     def close(self):
         """
         Tries to close the pool (avoid hanging threads)
         """
-        if hasattr(self, "pool") and self.pool is not None:
+        
+        if self.pool is not None:
             self.pool.close()
 
    
@@ -236,25 +252,25 @@ class _WeightWrapper(object):  # @DontTrace
     Allows for pickling the functionality.
     """
     
-    def __init__(self, prior, sigma, ws, thetas):
+    def __init__(self, prior, ws, sigma, samples):
         self.prior = prior
-        self.sigma = sigma
         self.ws = ws
-        self.thetas = thetas
+        self.sigma = sigma
+        self.samples = samples
     
     def __call__(self, theta):
         kernel = stats.multivariate_normal(theta, self.sigma).pdf
-        w = self.prior(theta) / np.sum(self.ws * kernel(self.thetas))
+        w = self.prior(theta) / np.sum(self.ws * kernel(self.samples))
         return w
     
-class _RejectionSamplingWrapper(object):  # @DontTrace
+class _PostfnWrapper(object):  # @DontTrace
     """
     Wraps the computation of new particles in the first iteration (simple rejection sampling).
     Allows for pickling the functionality.
     """
     
     def __init__(self, eps, prior, postfn, dist, Y):
-        self.eps = np.asarray(eps)
+        self.eps = eps
         self.prior = prior
         self.postfn = postfn
         self.dist = dist
@@ -265,8 +281,10 @@ class _RejectionSamplingWrapper(object):  # @DontTrace
         while True:
             thetai = self.prior()
             X = self.postfn(thetai)
-            p = np.asarray(self.dist(X, self.Y))
-            if np.all(p <= self.eps):
+            p = self.dist(X, self.Y)
+            #print("p=",p)
+            #print("threshold=",self.eps)
+            if (p <= self.eps).all():
                 break
             cnt+=1
         return thetai, p, cnt
